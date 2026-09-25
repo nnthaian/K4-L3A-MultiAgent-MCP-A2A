@@ -10,27 +10,31 @@ from .trace import TraceWriter
 async def solve_case(
     case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
 ) -> dict[str, Any]:
-    """Run one observable, deterministic A2A workflow without inventing evidence."""
+    """Run the MCP workflow; semantic analysis is evidence-grounded and LLM-pluggable."""
     case_id = _required_string(case, "case_id")
     request = case.get("customer_request", {})
     order_id = request.get("claimed_order_id") if isinstance(request, dict) else None
-    if not isinstance(order_id, str) or not order_id:
-        order_id = None
-
+    order_id = order_id if isinstance(order_id, str) and order_id else None
     available = set(await gateway.list_tools())
-    trace.emit(case_id=case_id, event_type="task_assigned", actor="coordinator", target="order-agent")
     evidence: list[dict[str, Any]] = []
-    await _run_specialist(case_id, gateway, trace, available, evidence, "order-agent", "order", order_id)
-    trace.emit(case_id=case_id, event_type="handoff", actor="order-agent", target="payment-agent")
-    await _run_specialist(case_id, gateway, trace, available, evidence, "payment-agent", "payment", order_id)
-    trace.emit(case_id=case_id, event_type="handoff", actor="payment-agent", target="shipment-agent")
-    await _run_specialist(case_id, gateway, trace, available, evidence, "shipment-agent", "shipment", order_id)
-    trace.emit(case_id=case_id, event_type="handoff", actor="shipment-agent", target="policy-agent")
-    await _run_specialist(
-        case_id, gateway, trace, available, evidence, "policy-agent", "policy", case.get("policy_version")
-    )
+    trace.emit(case_id=case_id, event_type="task_assigned", actor="coordinator", target="order-agent")
 
-    output = _build_output(case, evidence)
+    steps = [
+        ("order-agent", "order", order_id),
+        ("payment-agent", "payment", order_id),
+        ("shipment-agent", "shipment", order_id),
+        ("policy-agent", "policy", case.get("policy_version")),
+    ]
+    evidence_domains: dict[str, str] = {}
+    for index, (actor, domain, identifier) in enumerate(steps):
+        await _run_specialist(
+            case_id, gateway, trace, available, evidence, evidence_domains,
+            actor, domain, identifier,
+        )
+        if index < len(steps) - 1:
+            trace.emit(case_id=case_id, event_type="handoff", actor=actor, target=steps[index + 1][0])
+
+    output = _build_output(case, evidence, evidence_domains)
     trace.emit(
         case_id=case_id,
         event_type="policy_decided",
@@ -56,6 +60,7 @@ async def _run_specialist(
     trace: TraceWriter,
     available: set[str],
     evidence: list[dict[str, Any]],
+    evidence_domains: dict[str, str],
     actor: str,
     domain: str,
     identifier: str | None,
@@ -71,6 +76,7 @@ async def _run_specialist(
     except (RuntimeError, ValueError, TypeError):
         return
     evidence.append(result)
+    evidence_domains[result["evidence_ref"]] = domain
     trace.emit(
         case_id=case_id,
         event_type="tool_result_consumed",
@@ -87,35 +93,32 @@ def _select_tool(available: set[str], domain: str) -> str | None:
     return candidates[0] if candidates else None
 
 
-def _build_output(case: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
-    request = case.get("customer_request", {})
-    claims = request.get("claims", []) if isinstance(request, dict) else []
-    topics = [
-        claim.get("topic") for claim in claims
-        if isinstance(claim, dict) and isinstance(claim.get("topic"), str)
-    ]
+def _build_output(
+    case: dict[str, Any], evidence: list[dict[str, Any]], evidence_domains: dict[str, str]
+) -> dict[str, Any]:
+    claims = _claims(case)
     refs = [item["evidence_ref"] for item in evidence]
     data = [item.get("data") for item in evidence]
-    issue = _primary_issue(topics, data)
-    supported_topics = _supported_topics(data)
-    issue_supported = issue in supported_topics
-    confidence = 0.8 if issue_supported and len(refs) >= 2 else 0.55 if issue_supported else 0.15
-    claim_assessments = [
-        {
+    supported = _supported_topics(data)
+    issue = _primary_issue([claim.get("topic") for claim in claims], supported)
+    issue_supported = issue in supported
+    confidence = 0.85 if issue_supported and len(refs) >= 2 else 0.65 if issue_supported else 0.15
+    claim_assessments = []
+    for index, claim in enumerate(claims, 1):
+        topic = claim.get("topic")
+        supported_claim = _claim_supported(topic, data, supported)
+        claim_assessments.append({
             "claim_id": claim.get("claim_id", f"claim-{index}"),
-            "verdict": "supported" if claim.get("topic") in supported_topics else "insufficient_evidence",
-            "confidence": confidence if claim.get("topic") in supported_topics else 0.15,
-            "evidence_refs": refs,
-        }
-        for index, claim in enumerate(claims, 1)
-        if isinstance(claim, dict)
-    ]
+            "verdict": "supported" if supported_claim else "insufficient_evidence",
+            "confidence": confidence if supported_claim else 0.15,
+            "evidence_refs": _claim_refs(topic, refs, evidence_domains),
+        })
     return {
         "schema_version": "day09-l3a-output-v2",
         "case_id": case["case_id"],
         "assessment": {
             "primary_issue": issue,
-            "case_status": "needs_investigation" if issue == "insufficient_evidence" else "action_required",
+            "case_status": "action_required" if issue_supported else "needs_investigation",
             "confidence": confidence,
         },
         "affected_entities": _entities(case, data),
@@ -129,9 +132,9 @@ def _build_output(case: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[
 
 
 def _verify_output(output: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
-    refs = {item["evidence_ref"] for item in evidence}
-    output["evidence_refs"] = [ref for ref in output["evidence_refs"] if ref in refs]
-    output["assessment"]["confidence"] = min(1.0, max(0.0, output["assessment"]["confidence"]))
+    valid_refs = {item["evidence_ref"] for item in evidence}
+    output["evidence_refs"] = [ref for ref in output["evidence_refs"] if ref in valid_refs]
+    output["assessment"]["confidence"] = max(0.0, min(1.0, output["assessment"]["confidence"]))
     if output["assessment"]["primary_issue"] == "insufficient_evidence":
         output["assessment"]["case_status"] = "needs_investigation"
         output["assessment"]["confidence"] = min(output["assessment"]["confidence"], 0.15)
@@ -140,35 +143,109 @@ def _verify_output(output: dict[str, Any], evidence: list[dict[str, Any]]) -> di
     return output
 
 
+def _claims(case: dict[str, Any]) -> list[dict[str, Any]]:
+    request = case.get("customer_request", {})
+    claims = request.get("claims", []) if isinstance(request, dict) else []
+    return [claim for claim in claims if isinstance(claim, dict)]
+
+
+def _primary_issue(topics: list[Any], supported: set[str]) -> str:
+    for topic in topics:
+        if isinstance(topic, str) and topic in supported:
+            return topic
+    for topic in topics:
+        if topic in {"valid_split_payment", "unsupported_claim"}:
+            return topic
+    return "insufficient_evidence"
+
+
+def _claim_supported(topic: Any, data: list[Any], supported: set[str]) -> bool:
+    if topic in supported:
+        return True
+    return topic == "requested_full_refund" and "refund" in _evidence_text(data) and _has_refund_signal(data)
+
+
+def _supported_topics(data: list[Any]) -> set[str]:
+    text = _evidence_text(data)
+    topics: set[str] = set()
+    if _has(text, "canceled", "cancelled") and _has(text, "paid", "payment approved", "approved"):
+        topics.add("canceled_order_paid")
+    if _has(text, "unavailable", "out of stock", "not available") and _has(text, "paid", "approved"):
+        topics.add("unavailable_order_paid")
+    if _has(text, "late", "delayed", "overdue"):
+        if _has(text, "seller", "merchant", "vendor"):
+            topics.add("late_delivery_seller")
+        if _has(text, "logistics", "carrier", "shipping", "delivery provider"):
+            topics.add("late_delivery_logistics")
+    if _has(text, "mismatch", "different amount", "wrong amount"):
+        topics.add("payment_mismatch")
+    if _has(text, "duplicate", "double charge", "charged twice"):
+        topics.add("duplicate_charge")
+    if _has(text, "refund pending", "pending refund"):
+        topics.add("refund_pending")
+    if _has(text, "refund failed", "failed refund"):
+        topics.add("refund_failed")
+    if _has(text, "split payment", "installment", "parcel"):
+        topics.add("valid_split_payment")
+    return topics
+
+
+def _has(text: str, *terms: str) -> bool:
+    return any(term in text for term in terms)
+
+
+def _evidence_text(data: list[Any]) -> str:
+    parts: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                parts.append(str(key).replace("_", " ").lower())
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+        elif value is not None:
+            parts.append(str(value).replace("_", " ").lower())
+
+    visit(data)
+    return " ".join(parts)
+
+
+def _has_refund_signal(data: list[Any]) -> bool:
+    text = _evidence_text(data)
+    return _has(text, "eligible", "approved", "requested", "full refund")
+
+
+def _claim_refs(topic: Any, refs: list[str], domains: dict[str, str]) -> list[str]:
+    required = {"order"}
+    if topic in {"canceled_order_paid", "unavailable_order_paid", "valid_split_payment", "payment_mismatch", "duplicate_charge", "refund_pending", "refund_failed", "requested_full_refund"}:
+        required.add("payment")
+    if topic in {"late_delivery_seller", "late_delivery_logistics"}:
+        required.add("shipment")
+    return [ref for ref in refs if domains.get(ref) in required]
+
+
 def _root_cause(issue: str, data: list[Any]) -> dict[str, Any]:
     party_map = {
-        "late_delivery_seller": "seller",
-        "late_delivery_logistics": "logistics_provider",
-        "payment_mismatch": "payment_provider",
-        "duplicate_charge": "payment_provider",
-        "canceled_order_paid": "platform",
-        "unavailable_order_paid": "platform",
+        "late_delivery_seller": "seller", "late_delivery_logistics": "logistics_provider",
+        "payment_mismatch": "payment_provider", "duplicate_charge": "payment_provider",
+        "canceled_order_paid": "platform", "unavailable_order_paid": "platform",
     }
-    party_type = party_map.get(issue)
-    if not party_type:
+    party = party_map.get(issue)
+    if not party:
         return {"ranked_causes": [], "responsible_parties": []}
-    party_id = _first_value(data, "seller_id") if party_type == "seller" else None
-    return {
-        "ranked_causes": [{"cause_code": issue.upper(), "rank": 1}],
-        "responsible_parties": [{"party_type": party_type, "party_id": party_id}],
-    }
+    party_id = _first_value(data, "seller_id") if party == "seller" else None
+    return {"ranked_causes": [{"cause_code": issue.upper(), "rank": 1}], "responsible_parties": [{"party_type": party, "party_id": party_id}]}
 
 
 def _financial_resolution(issue: str, case: dict[str, Any], data: list[Any]) -> dict[str, Any]:
-    amount = _first_number(data, "recommended_refund_brl", "refund_amount_brl", "amount_brl")
-    if amount is None or issue not in {"canceled_order_paid", "unavailable_order_paid", "refund_pending", "refund_failed"}:
+    amount = _first_number(data, "recommended_refund_brl", "refund_amount_brl", "refund_amount", "amount_brl")
+    refundable = {"canceled_order_paid", "unavailable_order_paid", "refund_pending", "refund_failed"}
+    if amount is None or issue not in refundable:
         return {"currency": "BRL", "recommended_refund_brl": 0, "refund_lines": []}
     order_id = case.get("customer_request", {}).get("claimed_order_id")
-    return {
-        "currency": "BRL",
-        "recommended_refund_brl": amount,
-        "refund_lines": [{"reason_code": issue, "amount_brl": amount, "entity_id": order_id}],
-    }
+    return {"currency": "BRL", "recommended_refund_brl": amount, "refund_lines": [{"reason_code": issue, "amount_brl": amount, "entity_id": order_id}]}
 
 
 def _resolution_actions(issue: str, refs: list[str]) -> list[str]:
@@ -217,52 +294,24 @@ def _find_value(value: Any, wanted_key: str) -> Any:
 
 
 def _entities(case: dict[str, Any], data: list[Any]) -> dict[str, list[str]]:
-    values = {
-        "order_ids": [], "item_ids": [], "seller_ids": [],
-        "payment_references": [], "shipment_ids": [],
-    }
+    values = {"order_ids": [], "item_ids": [], "seller_ids": [], "payment_references": [], "shipment_ids": []}
     claimed = case.get("customer_request", {}).get("claimed_order_id")
     if isinstance(claimed, str):
         values["order_ids"].append(claimed)
-    for item in data:
-        _collect_entities(item, values)
-    return {key: list(dict.fromkeys(value))[:20] for key, value in values.items()}
+    mapping = {"order_id": "order_ids", "item_id": "item_ids", "seller_id": "seller_ids", "payment_id": "payment_references", "payment_reference": "payment_references", "shipment_id": "shipment_ids"}
 
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key in mapping and isinstance(nested, str):
+                    values[mapping[key]].append(nested)
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
 
-def _collect_entities(value: Any, values: dict[str, list[str]]) -> None:
-    if isinstance(value, dict):
-        mapping = {
-            "order_id": "order_ids", "item_id": "item_ids", "seller_id": "seller_ids",
-            "payment_id": "payment_references", "payment_reference": "payment_references",
-            "shipment_id": "shipment_ids",
-        }
-        for key, item in value.items():
-            target = mapping.get(key)
-            if target and isinstance(item, str):
-                values[target].append(item)
-            _collect_entities(item, values)
-    elif isinstance(value, list):
-        for item in value:
-            _collect_entities(item, values)
-
-
-def _supported_topics(data: list[Any]) -> set[str]:
-    text = str(data).lower()
-    topics = (
-        "canceled_order_paid", "late_delivery_seller", "late_delivery_logistics",
-        "payment_mismatch", "duplicate_charge", "refund_pending", "refund_failed",
-    )
-    return {topic for topic in topics if topic.replace("_", " ") in text}
-
-
-def _primary_issue(topics: list[str], data: list[Any]) -> str:
-    supported = _supported_topics(data)
-    for topic in topics:
-        if topic in supported:
-            return topic
-    if topics and topics[0] in {"valid_split_payment", "unsupported_claim"}:
-        return topics[0]
-    return "insufficient_evidence"
+    visit(data)
+    return {key: list(dict.fromkeys(items))[:20] for key, items in values.items()}
 
 
 def _required_string(value: dict[str, Any], key: str) -> str:
