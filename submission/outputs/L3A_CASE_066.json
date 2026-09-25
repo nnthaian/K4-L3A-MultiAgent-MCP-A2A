@@ -1,0 +1,63 @@
+{
+  "schema_version": "day09-l3a-output-v2",
+  "case_id": "L3A_CASE_066",
+  "assessment": {
+    "primary_issue": "insufficient_evidence",
+    "case_status": "needs_investigation",
+    "confidence": 0.15
+  },
+  "affected_entities": {
+    "order_ids": [
+      "9c9353e8fd52f68f8442e580b5f2bba6"
+    ],
+    "item_ids": [],
+    "seller_ids": [
+      "seller-9c9353e8fd52"
+    ],
+    "payment_references": [],
+    "shipment_ids": []
+  },
+  "claim_assessments": [
+    {
+      "claim_id": "claim-066-a",
+      "verdict": "insufficient_evidence",
+      "confidence": 0.15,
+      "evidence_refs": [
+        "ev_yJ7ycj6aEFvrb8WJEKxXjbcg_bbjZNy0",
+        "ev_fcYABPmRTxGDpNsBYLbzC1bVKlUR1W5Y",
+        "ev_I0lR6G8yqkNNeDRFCtyw4PoYouXNn9yB",
+        "ev_AXde5csaeClyKP8Ey-hbJYmJkDPHA6eu"
+      ]
+    },
+    {
+      "claim_id": "claim-066-b",
+      "verdict": "insufficient_evidence",
+      "confidence": 0.15,
+      "evidence_refs": [
+        "ev_yJ7ycj6aEFvrb8WJEKxXjbcg_bbjZNy0",
+        "ev_fcYABPmRTxGDpNsBYLbzC1bVKlUR1W5Y",
+        "ev_I0lR6G8yqkNNeDRFCtyw4PoYouXNn9yB",
+        "ev_AXde5csaeClyKP8Ey-hbJYmJkDPHA6eu"
+      ]
+    }
+  ],
+  "root_cause_analysis": {
+    "ranked_causes": [],
+    "responsible_parties": []
+  },
+  "evidence_refs": [
+    "ev_yJ7ycj6aEFvrb8WJEKxXjbcg_bbjZNy0",
+    "ev_fcYABPmRTxGDpNsBYLbzC1bVKlUR1W5Y",
+    "ev_I0lR6G8yqkNNeDRFCtyw4PoYouXNn9yB",
+    "ev_AXde5csaeClyKP8Ey-hbJYmJkDPHA6eu"
+  ],
+  "data_conflicts": [],
+  "financial_resolution": {
+    "currency": "BRL",
+    "recommended_refund_brl": 0,
+    "refund_lines": []
+  },
+  "resolution_actions": [
+    "review_case"
+  ]
+}

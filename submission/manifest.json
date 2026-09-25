@@ -1,0 +1,13 @@
+{
+  "schema_version": "day09-submission-manifest-v2",
+  "competition_id": "day09-multiagent-mcp-a2a",
+  "variant_id": "l3a",
+  "case_set_version": "v2.1",
+  "output_schema_version": "day09-l3a-output-v2",
+  "trace_schema_version": "day09-trace-event-v1",
+  "generated_at": "2026-09-25T08:00:00Z",
+  "client": {
+    "name": "day09-student-starter",
+    "version": "0.1.0"
+  }
+}
